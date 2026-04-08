@@ -20,7 +20,7 @@ Battery level is reported alongside the distance.
 | I2C SDA | GP0 |
 | I2C SCL | GP1 |
 | VL53L0X XSHUT | GP2 |
-| Battery ADC | GP6 (via 1MΩ + 1MΩ voltage divider) |
+| Battery ADC | GP5 (via 1MΩ + 1MΩ voltage divider) |
 | Credentials clear | GP9 (BOOT button) |
 
 The voltage divider uses two equal 1 MΩ resistors: `Vbat → R1 → GP6 → R2 → GND`.
@@ -30,13 +30,16 @@ This halves the battery voltage so it stays within the ESP32's ADC input range.
 
 ```
 water_softener/
-└── water_softener.ino      Arduino sketch
-water_softener_converter.js  Zigbee2MQTT external converter
+└── water_softener.ino              Arduino sketch
+water_softener_converter.js          Zigbee2MQTT external converter
+water_softener_debounce_ext.js       Zigbee2MQTT external extension (debounce)
+water_softener_idf/                  Alternative ESP-IDF Zigbee port (experimental)
+└── water_softener_idf.ino
 ```
 
 ---
 
-## Build & Flash
+## Build & Deploy
 
 ### Prerequisites
 
@@ -44,16 +47,18 @@ water_softener_converter.js  Zigbee2MQTT external converter
 # Install arduino-cli (macOS)
 brew install arduino-cli
 
-# Add the Espressif board index
+# Initialize arduino-cli config
 arduino-cli config init
+
+# Add the Espressif board index
 arduino-cli config add board_manager.additional_urls \
   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-# Install the ESP32 core (includes Zigbee library)
+# Update board index and install ESP32 core
 arduino-cli core update-index
 arduino-cli core install esp32:esp32
 
-# Install the VL53L0X library
+# Install VL53L0X library
 arduino-cli lib install "VL53L0X"
 ```
 
@@ -61,13 +66,15 @@ arduino-cli lib install "VL53L0X"
 
 ```bash
 arduino-cli compile \
-  --fqbn "esp32:esp32:makergo_c6_supermini:ZigbeeMode=ed,PartitionScheme=zigbee" \
+  --fqbn "esp32:esp32:makergo_c6_supermini:CDCOnBoot=cdc,ZigbeeMode=ed,PartitionScheme=zigbee" \
   water_softener
 ```
 
+**Important:** `CDCOnBoot=cdc` enables USB CDC serial output. Without it, `Serial.printf()` produces no output.
+
 Expected output: ~49% flash, ~10% RAM used.
 
-### Find the device port
+### Find the Device Port
 
 Plug in the ESP32-C6 via USB, then:
 
@@ -75,35 +82,51 @@ Plug in the ESP32-C6 via USB, then:
 arduino-cli board list
 ```
 
-Look for a USB serial port, e.g. `/dev/cu.usbserial-XXXX` (macOS) or `/dev/ttyUSB0` (Linux).
+Look for a USB serial port:
+- **macOS**: `/dev/cu.usbmodem*` or `/dev/cu.usbserial-*`
+- **Linux**: `/dev/ttyUSB*`
+- **Windows**: `COM*`
+
+Example output:
+```
+Port                          FQBN                                                   Type
+/dev/cu.usbmodem21201         esp32:esp32:makergo_c6_supermini                       Serial Port (USB)
+```
 
 ### Upload
 
 ```bash
 arduino-cli upload \
-  --fqbn "esp32:esp32:makergo_c6_supermini:ZigbeeMode=ed,PartitionScheme=zigbee" \
-  --port /dev/cu.usbserial-XXXX \
+  --fqbn "esp32:esp32:makergo_c6_supermini:CDCOnBoot=cdc,ZigbeeMode=ed,PartitionScheme=zigbee" \
+  --port /dev/cu.usbmodem21201 \
   water_softener
 ```
 
-Replace `/dev/cu.usbserial-XXXX` with the port from the previous step.
+Replace `/dev/cu.usbmodem21201` with your device port.
 
-### Monitor serial output
+### Monitor Serial Output
 
 ```bash
-arduino-cli monitor --port /dev/cu.usbserial-XXXX --config baudrate=115200
+arduino-cli monitor --port /dev/cu.usbmodem21201 --config baudrate=921600
 ```
 
-Press `Ctrl+C` to exit the monitor.
+Expected output on boot:
+```
+[ZB] Init
+[ZB] Zigbee initialized
+[ZB] Measurement: distance=42.3cm, battery=85%
+[ZB] Attribute report sent
+```
+
+Press `Ctrl+C` to exit.
 
 ---
 
-## Zigbee2MQTT Converter
+## Zigbee2MQTT Setup
 
-### Install
+### Converter Installation
 
-Copy `water_softener_converter.js` to your Zigbee2MQTT `external_converters` directory,
-then add it to `configuration.yaml`:
+Copy `water_softener_converter.js` to your Zigbee2MQTT `external_converters` directory and add it to `configuration.yaml`:
 
 ```yaml
 external_converters:
@@ -112,17 +135,84 @@ external_converters:
 
 Restart Zigbee2MQTT.
 
+### Extension Installation (Debounce)
+
+The device produces multiple messages per wake cycle due to Z2M's `publishLastSeen` mechanism republishing cached state. Install `water_softener_debounce_ext.js` to suppress duplicates and publish only fresh values.
+
+#### Option A: SCP Deployment
+
+```bash
+# Copy extension to Z2M server
+scp water_softener_debounce_ext.js \
+  george@10.0.1.58:~/build/zigbee2mqtt-docker/data/external_extensions/
+```
+
+Add to `configuration.yaml`:
+
+```yaml
+external_extensions:
+  - water_softener_debounce_ext.js
+```
+
+#### Option B: Docker Volume Mount (Development)
+
+If running Z2M in Docker, mount the local directory:
+
+```bash
+docker run -d \
+  --name zigbee2mqtt \
+  -v /path/to/zigbee-water-softener:/app/data/external_extensions \
+  koenkk/zigbee2mqtt
+```
+
+Edit locally; Z2M picks up changes on `docker restart zigbee2mqtt`.
+
+#### Option C: Automated Deployment (GitHub Actions)
+
+Create `.github/workflows/deploy-extension.yml`:
+
+```yaml
+name: Deploy Z2M Extension
+on:
+  push:
+    paths:
+      - water_softener_debounce_ext.js
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.Z2M_HOST }}
+          username: ${{ secrets.Z2M_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "water_softener_debounce_ext.js"
+          target: "~/build/zigbee2mqtt-docker/data/external_extensions/"
+```
+
+### Configuration
+
+Add device config to `configuration.yaml`:
+
+```yaml
+devices:
+  '0x58e6c5fffe171d98':
+    friendly_name: water-softener-salt-level
+    availability: false  # Disable Z2M's last_seen, let extension handle it
+```
+
 ### Pairing
 
-On first power-on (or after a credential clear), the device enters commissioning mode
-and will appear in Zigbee2MQTT as `WaterSoftener-v1` once joined.
+On first power-on (or after credential reset), the device enters commissioning mode and joins Zigbee2MQTT. Once paired, the device will publish distance and battery every ~12 hours (or sooner if values change significantly).
 
-### Published values
+### Published Values
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `distance` | number (cm) | Distance from sensor to salt surface |
-| `battery` | number (%) | Estimated battery charge |
+| `distance` | number (cm) | Distance from sensor to salt surface (0–200 cm) |
+| `battery` | number (%) | Estimated battery charge (0–100%) |
+| `linkquality` | number (LQI) | Zigbee signal strength (0–255) |
 
 ---
 
@@ -130,9 +220,34 @@ and will appear in Zigbee2MQTT as `WaterSoftener-v1` once joined.
 
 To re-pair the device with a different Zigbee network:
 
-1. Hold the **BOOT button** (GPIO9) while applying power (or pressing RST)
-2. Keep it held until the serial monitor shows `[ZB] Credentials erased`
+1. **Hold BOOT button** (GPIO9) while applying power or pressing RST
+2. Keep held until serial monitor shows: `[ZB] Credentials erased`
 3. Release — the device will start commissioning immediately
+
+---
+
+## Troubleshooting
+
+### No serial output on monitor
+
+**Cause:** `CDCOnBoot=cdc` missing from FQBN  
+**Fix:** Recompile and reupload with the correct FQBN (see Compile section above)
+
+### Device not appearing in Zigbee2MQTT
+
+1. Check Z2M logs: `docker logs zigbee2mqtt | tail -50`
+2. Verify the device is powered and can reach the Zigbee coordinator
+3. Try credential reset (see above)
+
+### Duplicate MQTT messages
+
+**Cause:** Extension not loaded  
+**Fix:** Verify `water_softener_debounce_ext.js` is in the `external_extensions` directory and listed in `configuration.yaml`
+
+### Stale distance values
+
+**Cause:** Extension not suppressing old cached state on reconnect  
+**Fix:** Check Z2M logs for `WaterSoftenerDebounce extension started`. Ensure `availability: false` is set in device config.
 
 ---
 
