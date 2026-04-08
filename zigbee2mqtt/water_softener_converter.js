@@ -48,16 +48,10 @@ module.exports = {
             .withDescription('Remaining battery in %'),
     ],
     configure: async (device, coordinatorEndpoint, definition) => {
+        // Binds needed for the Arduino version (reports via binding table).
+        // The ESP-IDF version sends directly to coordinator 0x0000 and
+        // doesn't need these, but they're harmless with the debounce extension.
         const endpoint = device.getEndpoint(1);
-
-        // Bind both clusters so the coordinator receives the device's explicit
-        // attribute reports (sent via reportAnalogInput() / reportBatteryPercentage()
-        // on each wake). configureReporting is intentionally omitted: z2m re-runs
-        // configure on every end-device rejoin, and the ESP32 Zigbee stack
-        // responds to each configureReporting command with an immediate attribute
-        // report — before the fresh measurement has been loaded — producing stale
-        // duplicate publishes. The device reports on its own schedule; no
-        // automatic/periodic reporting configuration is needed.
         await endpoint.bind('genPowerCfg', coordinatorEndpoint);
         await endpoint.bind('genAnalogInput', coordinatorEndpoint);
     },
