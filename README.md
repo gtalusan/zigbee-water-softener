@@ -1,5 +1,7 @@
 # Water Softener Salt Level Detector
 
+![Water softener detector build photo](IMG_8477.jpeg)
+
 ESP32-C6 SuperMini + VL53L0X time-of-flight sensor that measures the distance
 to the salt surface inside a brine tank and reports it via Zigbee every 12 hours.
 Battery level is reported alongside the distance.
@@ -33,8 +35,6 @@ water_softener/
 └── water_softener.ino              Arduino sketch
 water_softener_converter.js          Zigbee2MQTT external converter
 water_softener_debounce_ext.js       Zigbee2MQTT external extension (debounce)
-water_softener_idf/                  Alternative ESP-IDF Zigbee port (experimental)
-└── water_softener_idf.ino
 ```
 
 ---
