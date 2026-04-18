@@ -307,6 +307,9 @@ void loop() {
   uint8_t voltageZb = 0;
   uint8_t battPct   = measureBattery(&voltageZb);
 
+  pinMode(PIN_SDA, INPUT);
+  pinMode(PIN_SCL, INPUT);
+
   if (distanceCm > 0.0f) {
     zbSensor.setAnalogInput(distanceCm);
     _pendingReports = 1;
