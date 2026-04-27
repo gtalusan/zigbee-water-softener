@@ -6,6 +6,9 @@ ESP32-C6 SuperMini + VL53L0X time-of-flight sensor that measures the distance
 to the salt surface inside a brine tank and reports it via Zigbee every 12 hours.
 Battery level is reported alongside the distance.
 
+**V2 firmware** (ESP-IDF C, `esp32/`) replaces the original Arduino sketch with
+bare-metal deep sleep, a graduated sleep ramp, and RTC-persisted telemetry.
+
 ## Hardware
 
 | Component | Details |
@@ -23,25 +26,83 @@ Battery level is reported alongside the distance.
 | I2C SCL | GP1 |
 | VL53L0X XSHUT | GP2 |
 | Battery ADC | GP5 (via 1MΩ + 1MΩ voltage divider) |
-| Credentials clear | GP9 (BOOT button) |
+| Factory reset | GP9 (BOOT button) |
 
-The voltage divider uses two equal 1 MΩ resistors: `Vbat → R1 → GP6 → R2 → GND`.
+The voltage divider uses two equal 1 MΩ resistors: `Vbat → R1 → ADC pin → R2 → GND`.
 This halves the battery voltage so it stays within the ESP32's ADC input range.
 
 ## Files
 
 ```
-water_softener/
-└── water_softener.ino              Arduino sketch
-water_softener_converter.js          Zigbee2MQTT external converter
-water_softener_debounce_ext.js       Zigbee2MQTT external extension (debounce)
+├── water_softener/
+│   └── water_softener.ino              Arduino sketch (V1, legacy)
+├── zigbee2mqtt/water_softener_converter.js         Zigbee2MQTT external converter (V1 + V2)
+├── esp32/
+│   ├── CMakeLists.txt                  Top-level project
+│   ├── sdkconfig                       Full Kconfig
+│   ├── sdkconfig.defaults              Minimal non-default Kconfig
+│   ├── partitions.csv                  Custom partition table
+│   ├── dependencies.lock               Component version lock
+│   └── main/
+│       ├── CMakeLists.txt              Component registration
+│       ├── idf_component.yml           Dependencies (ESP-Zigbee-lib, IDF)
+│       ├── main.c                      Application (sleep ramp, Zigbee, reporting)
+│       ├── sensors.c / sensors.h       Battery ADC + distance wrapper
+│       ├── vl53l0x.c / vl53l0x.h       VL53L0X ToF driver
+│       └── custom_cluster.c / .h       Custom Zigbee cluster 0xFC00
 ```
 
 ---
 
 ## Build & Deploy
 
-### Prerequisites
+### ESP-IDF (V2 Firmware)
+
+The V2 firmware is a bare-metal ESP-IDF C project in `esp32/`. It uses deep sleep
+with a graduated sleep ramp (4× 60 s burst → 5 min → 12 h over a 12 h window)
+and persists telemetry in RTC memory across sleep cycles.
+
+#### Prerequisites
+
+- ESP-IDF v5.2+ (tested with v5.5.4)
+- ESP32-C6 toolchain (riscv32-esp-elf)
+
+```bash
+# Install ESP-IDF (if not already installed)
+git clone --recursive https://github.com/espressif/esp-idf.git
+cd esp-idf && ./install.sh esp32c6 && . ./export.sh
+```
+
+#### Compile & Flash
+
+```bash
+cd esp32
+idf.py set-target esp32c6
+idf.py build
+idf.py -p /dev/cu.usbmodem* flash
+```
+
+#### Monitor
+
+```bash
+idf.py -p /dev/cu.usbmodem* monitor
+```
+
+Expected output on boot:
+```
+WATER_SOFTENER: Reset reason: 1
+WATER_SOFTENER: Cold boot — ramp reset
+WATER_SOFTENER: Starting Zigbee stack
+WATER_SOFTENER: dist=42.3 cm  batt=85%  wake=1  rt=2345 ms  prev_rt=0 ms
+WATER_SOFTENER: Deep sleep 60 s  (elapsed=0  wake=1)
+```
+
+### Arduino (V1 Firmware, Legacy)
+
+The original Arduino sketch (`water_softener.ino`) is deprecated in favor of the
+ESP-IDF firmware but remains functional.
+
+#### Prerequisites
 
 ```bash
 # Install arduino-cli (macOS)
@@ -62,7 +123,7 @@ arduino-cli core install esp32:esp32
 arduino-cli lib install "VL53L0X"
 ```
 
-### Compile
+#### Compile
 
 ```bash
 arduino-cli compile \
@@ -74,7 +135,7 @@ arduino-cli compile \
 
 Expected output: ~49% flash, ~10% RAM used.
 
-### Find the Device Port
+#### Find the Device Port
 
 Plug in the ESP32-C6 via USB, then:
 
@@ -93,7 +154,7 @@ Port                          FQBN                                              
 /dev/cu.usbmodem21201         esp32:esp32:makergo_c6_supermini                       Serial Port (USB)
 ```
 
-### Upload
+#### Upload
 
 ```bash
 arduino-cli upload \
@@ -104,7 +165,7 @@ arduino-cli upload \
 
 Replace `/dev/cu.usbmodem21201` with your device port.
 
-### Monitor Serial Output
+#### Monitor Serial Output
 
 ```bash
 arduino-cli monitor --port /dev/cu.usbmodem21201 --config baudrate=921600
@@ -135,62 +196,6 @@ external_converters:
 
 Restart Zigbee2MQTT.
 
-### Extension Installation (Debounce)
-
-The device produces multiple messages per wake cycle due to Z2M's `publishLastSeen` mechanism republishing cached state. Install `water_softener_debounce_ext.js` to suppress duplicates and publish only fresh values.
-
-#### Option A: SCP Deployment
-
-```bash
-# Copy extension to Z2M server
-scp water_softener_debounce_ext.js \
-  george@10.0.1.58:~/build/zigbee2mqtt-docker/data/external_extensions/
-```
-
-Add to `configuration.yaml`:
-
-```yaml
-external_extensions:
-  - water_softener_debounce_ext.js
-```
-
-#### Option B: Docker Volume Mount (Development)
-
-If running Z2M in Docker, mount the local directory:
-
-```bash
-docker run -d \
-  --name zigbee2mqtt \
-  -v /path/to/zigbee-water-softener:/app/data/external_extensions \
-  koenkk/zigbee2mqtt
-```
-
-Edit locally; Z2M picks up changes on `docker restart zigbee2mqtt`.
-
-#### Option C: Automated Deployment (GitHub Actions)
-
-Create `.github/workflows/deploy-extension.yml`:
-
-```yaml
-name: Deploy Z2M Extension
-on:
-  push:
-    paths:
-      - water_softener_debounce_ext.js
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.Z2M_HOST }}
-          username: ${{ secrets.Z2M_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "water_softener_debounce_ext.js"
-          target: "~/build/zigbee2mqtt-docker/data/external_extensions/"
-```
-
 ### Configuration
 
 Add device config to `configuration.yaml`:
@@ -199,7 +204,6 @@ Add device config to `configuration.yaml`:
 devices:
   '0x58e6c5fffe171d98':
     friendly_name: water-softener-salt-level
-    availability: false  # Disable Z2M's last_seen, let extension handle it
 ```
 
 ### Pairing
@@ -207,6 +211,19 @@ devices:
 On first power-on (or after credential reset), the device enters commissioning mode and joins Zigbee2MQTT. Once paired, the device will publish distance and battery every ~12 hours (or sooner if values change significantly).
 
 ### Published Values
+
+#### V2 (Custom Cluster 0xFC00)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `distance` | number (cm) | Distance from sensor to salt surface (0–200 cm) |
+| `battery` | number (%) | Estimated battery charge (0–100%) |
+| `wake_count` | number | Total deep-sleep wake cycles since cold boot |
+| `last_runtime_ms` | number (ms) | Duration of previous wake period |
+| `vl53_error_count` | number | Count of VL53L0X read failures (distance=0) |
+| `linkquality` | number (LQI) | Zigbee signal strength (0–255) |
+
+#### V1 (Analog Input Cluster)
 
 | Key | Type | Description |
 |-----|------|-------------|
@@ -239,21 +256,40 @@ To re-pair the device with a different Zigbee network:
 2. Verify the device is powered and can reach the Zigbee coordinator
 3. Try credential reset (see above)
 
-### Duplicate MQTT messages
-
-**Cause:** Extension not loaded  
-**Fix:** Verify `water_softener_debounce_ext.js` is in the `external_extensions` directory and listed in `configuration.yaml`
-
-### Stale distance values
-
-**Cause:** Extension not suppressing old cached state on reconnect  
-**Fix:** Check Z2M logs for `WaterSoftenerDebounce extension started`. Ensure `availability: false` is set in device config.
 
 ---
 
 ## Configuration
 
-All tunable values are `#define` constants at the top of `water_softener.ino`:
+### V2 (ESP-IDF) — `esp32/main/main.c`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `PIN_VL53_XSHUT` | `2` | VL53L0X power control pin |
+| `PIN_BOOT_BUTTON` | `9` | Factory-reset button pin |
+| `INITIAL_SLEEP_SEC` | `60` | Sleep duration for first 4 wake cycles |
+| `INITIAL_SLEEP_COUNT` | `4` | Number of initial short-sleep cycles |
+| `MIN_SLEEP_SEC` | `300` (5 min) | Minimum deep sleep duration |
+| `MAX_SLEEP_SEC` | `43200` (12 h) | Maximum deep sleep duration |
+| `RAMP_WINDOW_SEC` | `43200` (12 h) | Duration of the linear ramp phase |
+
+### V2 (ESP-IDF) — `esp32/main/sensors.c`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `ADC_ATTEN` | `ADC_ATTEN_DB_11` | ADC attenuation |
+| `ADC_SAMPLES` | `5` | ADC readings per measurement |
+| `BATT_DIVIDER_RATIO` | `2.0` | ADC multiplier (1M + 1M divider) |
+| `BATT_MAX_MV` | `4200` | Battery voltage at 100% (mV) |
+| `BATT_MIN_MV` | `3300` | Battery voltage at 0% (mV) |
+
+### V2 (ESP-IDF) — `esp32/main/vl53l0x.c`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `dist_samples` | `10` | VL53L0X readings per measurement (trimmed mean) |
+
+### V1 (Arduino) — `water_softener/water_softener.ino`
 
 | Constant | Default | Description |
 |----------|---------|-------------|

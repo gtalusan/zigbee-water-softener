@@ -1,0 +1,11 @@
+# ESP-IDF build output
+esp32/build/
+
+# Managed components (fetched by IDF component manager)
+esp32/managed_components/
+
+# Clangd index cache
+esp32/.cache/
+
+# macOS
+.DS_Store
