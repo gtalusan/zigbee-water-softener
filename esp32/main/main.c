@@ -140,6 +140,18 @@ static void enter_sleep(void)
              sec, _rtc_ramp_elapsed, _rtc_wake_count);
 
     vl53l0x_deinit();
+
+    /* I2C + XSHUT pins: input + pulldown to prevent leakage through
+       the unpowered ToF sensor (saves 8-12 uA in deep sleep). */
+    gpio_config_t i2c_pulldown = {
+        .pin_bit_mask = BIT64(PIN_I2C_SDA) | BIT64(PIN_I2C_SCL) | BIT64(PIN_VL53_XSHUT),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&i2c_pulldown);
+
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));  /* let USB CDC drain */
     esp_sleep_enable_timer_wakeup(SEC_TO_US(sec));
@@ -183,7 +195,7 @@ static void measure_report_and_sleep(void)
 
     ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  voltage=%u mV  wake=%"PRIu32"  rt=%"PRIu32" ms"
              "  prev_rt=%"PRIu32" ms",
-             dist, batt_pct, voltage_zb, wake_count,
+             dist, batt_pct, voltage_zb * 100, wake_count,
              (uint32_t)(esp_timer_get_time() / 1000 - start_ms),
              _rtc_last_runtime);
 
@@ -491,6 +503,16 @@ void app_main(void)
     if (gpio_get_level(PIN_BOOT_BUTTON) == 0) {
         factory_reset();
     }
+
+    /* Pull unused GPIOs low to prevent floating-input leakage during sleep */
+    gpio_config_t unused_cfg = {
+        .pin_bit_mask = BIT64(PIN_UNUSED_8),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&unused_cfg);
 
     ESP_LOGI(TAG, "Starting Zigbee stack");
     xTaskCreate(zigbee_task, "zb_task", 4096, NULL, 5, NULL);
