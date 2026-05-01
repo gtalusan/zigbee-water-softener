@@ -11,9 +11,7 @@
 
 static const char *TAG = "VL53L0X";
 
-#define PIN_I2C_SDA         0
-#define PIN_I2C_SCL         1
-#define PIN_VL53_XSHUT      2
+#include "pins.h"
 #define VL53_ADDR            0x29
 #define I2C_FREQ_HZ          100000
 

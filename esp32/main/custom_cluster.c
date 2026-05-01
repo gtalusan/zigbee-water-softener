@@ -7,7 +7,7 @@ static uint8_t _ep_id = 1;
 
 /* ---------- attribute reporting ---------- */
 
-static void send_attr_report(uint16_t attr_id)
+static void send_attr_report(uint16_t attr_id, const ezb_zcl_cmd_cnf_ctx_t *cnf_ctx)
 {
     ezb_zcl_report_attr_cmd_t cmd = {
         .cmd_ctrl.dst_addr   = EZB_ADDRESS_SHORT(0x0000),
@@ -16,40 +16,42 @@ static void send_attr_report(uint16_t attr_id)
         .cmd_ctrl.cluster_id = CUSTOM_CLUSTER_ID,
         .cmd_ctrl.manuf_code = EZB_ZCL_STD_MANUF_CODE,
         .cmd_ctrl.fc.direction       = 1,
-        .cmd_ctrl.fc.dis_default_rsp = 1,
         .payload.attr_id = attr_id,
     };
+    if (cnf_ctx) {
+        cmd.cmd_ctrl.cnf_ctx = *cnf_ctx;
+    }
     ezb_err_t ret = ezb_zcl_report_attr_cmd_req(&cmd);
     if (ret != EZB_ERR_NONE) {
         ESP_LOGW(TAG, "report attr 0x%04X failed: %d", attr_id, ret);
     }
 }
 
-static void set_and_report(uint16_t attr_id, void *value)
+static void set_and_report(uint16_t attr_id, void *value, const ezb_zcl_cmd_cnf_ctx_t *cnf_ctx)
 {
     ezb_zcl_set_attr_value(_ep_id, CUSTOM_CLUSTER_ID, EZB_ZCL_CLUSTER_SERVER,
                            attr_id, EZB_ZCL_STD_MANUF_CODE, value, false);
-    send_attr_report(attr_id);
+    send_attr_report(attr_id, cnf_ctx);
 }
 
-void custom_cluster_report_distance(float distance_cm)
+void custom_cluster_report_distance(float distance_cm, const ezb_zcl_cmd_cnf_ctx_t *cnf_ctx)
 {
-    set_and_report(ATTR_DISTANCE, &distance_cm);
+    set_and_report(ATTR_DISTANCE, &distance_cm, cnf_ctx);
 }
 
-void custom_cluster_report_wake_count(uint32_t count)
+void custom_cluster_report_wake_count(uint32_t count, const ezb_zcl_cmd_cnf_ctx_t *cnf_ctx)
 {
-    set_and_report(ATTR_WAKE_COUNT, &count);
+    set_and_report(ATTR_WAKE_COUNT, &count, cnf_ctx);
 }
 
-void custom_cluster_report_runtime_ms(uint32_t ms)
+void custom_cluster_report_runtime_ms(uint32_t ms, const ezb_zcl_cmd_cnf_ctx_t *cnf_ctx)
 {
-    set_and_report(ATTR_LAST_RUNTIME_MS, &ms);
+    set_and_report(ATTR_LAST_RUNTIME_MS, &ms, cnf_ctx);
 }
 
-void custom_cluster_report_vl53_error_count(uint32_t count)
+void custom_cluster_report_vl53_error_count(uint32_t count, const ezb_zcl_cmd_cnf_ctx_t *cnf_ctx)
 {
-    set_and_report(ATTR_VL53_ERROR_COUNT, &count);
+    set_and_report(ATTR_VL53_ERROR_COUNT, &count, cnf_ctx);
 }
 
 /* ---------- custom cluster handler callbacks ---------- */

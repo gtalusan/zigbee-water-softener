@@ -30,10 +30,10 @@
 // ---------------------------------------------------------------------------
 // Configuration — adjust for hardware changes
 // ---------------------------------------------------------------------------
-#define PIN_SDA               0
-#define PIN_SCL               1
-#define PIN_VL53_XSHUT        2    // HIGH = sensor on, LOW = sensor off (saves power)
-#define PIN_BATT_ADC          5    // ADC pin behind 1:1 voltage divider
+#define PIN_SDA               13
+#define PIN_SCL               12
+#define PIN_VL53_XSHUT        14    // HIGH = sensor on, LOW = sensor off (saves power)
+#define PIN_BATT_ADC          1    // ADC pin behind 1:1 voltage divider
 #define PIN_CLEAR_CREDS       9    // BOOT button — hold at power-on to re-commission
 
 #define INITIAL_SLEEP_SEC     60ULL                    // 1 minute — used for first N wakes

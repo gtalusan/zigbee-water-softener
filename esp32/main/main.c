@@ -1,5 +1,5 @@
 /*
- * Water Softener Salt Level Sensor — ESP32-C6 Sleepy End Device
+ * Water Softener Salt Level Sensor — ESP32-C6/H2 Sleepy End Device
  *
  * Wakes from deep sleep, reports hardcoded distance + battery via custom
  * Zigbee cluster 0xFC00, then goes back to sleep.  Sleep interval ramps
@@ -18,12 +18,11 @@
 #include "custom_cluster.h"
 #include "vl53l0x.h"
 #include "sensors.h"
+#include "pins.h"
 
 static const char *TAG = "WATER_SOFTENER";
 
 /* ---------- hardware pin assignments ---------- */
-#define PIN_VL53_XSHUT   2
-#define PIN_BOOT_BUTTON  9
 #define ZIGBEE_ENDPOINT  1
 
 /* ---------- sleep ramp ---------- */
@@ -81,10 +80,31 @@ static uint32_t                _wake_start_ms;      // captured in app_main(), u
 static esp_timer_handle_t s_sleep_timer;  // one-shot timer for deferred sleep
 static bool s_needs_interview;             // captured before steering
 
-/* 5 s delay for radio TX — matching Arduino sketch behaviour */
+#define REPORT_TIMEOUT_MS 10000
+
+static volatile int8_t _pending_reports;
+
+static void report_cnf_cb(ezb_af_user_cnf_t *cnf, void *user_ctx)
+{
+    if (cnf->status == 0) {
+        _pending_reports--;
+    }
+}
+
+static const ezb_zcl_cmd_cnf_ctx_t s_report_cnf_ctx = {
+    .cb       = report_cnf_cb,
+    .user_ctx = NULL,
+};
+
 static void wait_for_reports(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    uint32_t t0 = esp_timer_get_time() / 1000;
+    while (_pending_reports > 0 && (esp_timer_get_time() / 1000 - t0) < REPORT_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (_pending_reports > 0) {
+        ESP_LOGW(TAG, "%d reports timed out", _pending_reports);
+    }
 }
 
 /* ---------- sleep ramp ---------- */
@@ -123,6 +143,10 @@ static void enter_sleep(void)
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(100));  /* let USB CDC drain */
     esp_sleep_enable_timer_wakeup(SEC_TO_US(sec));
+
+    /* Total wake-cycle runtime (app_main entry → now) for reporting next cycle */
+    _rtc_last_runtime = (uint32_t)(esp_timer_get_time() / 1000 - _wake_start_ms);
+
     esp_deep_sleep_start();
 }
 
@@ -157,24 +181,30 @@ static void measure_report_and_sleep(void)
     uint8_t  voltage_zb = 0;
     uint8_t  batt_pct   = measure_battery(&voltage_zb);
 
-    ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  wake=%"PRIu32"  rt=%"PRIu32" ms"
+    ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  voltage=%u mV  wake=%"PRIu32"  rt=%"PRIu32" ms"
              "  prev_rt=%"PRIu32" ms",
-             dist, batt_pct, wake_count,
+             dist, batt_pct, voltage_zb, wake_count,
              (uint32_t)(esp_timer_get_time() / 1000 - start_ms),
              _rtc_last_runtime);
 
+    _pending_reports = 0;
+
     if (dist > 0.0f) {
-        custom_cluster_report_distance(dist);
+        _pending_reports++;
+        custom_cluster_report_distance(dist, &s_report_cnf_ctx);
         _rtc_vl53_error_count = 0;
     } else {
         _rtc_vl53_error_count++;
     }
-    custom_cluster_report_vl53_error_count(_rtc_vl53_error_count);
-    custom_cluster_report_wake_count(wake_count);
+    _pending_reports++;
+    custom_cluster_report_vl53_error_count(_rtc_vl53_error_count, &s_report_cnf_ctx);
+    _pending_reports++;
+    custom_cluster_report_wake_count(wake_count, &s_report_cnf_ctx);
 
     /* Report previous cycle's full runtime */
     if (_rtc_last_runtime > 0) {
-        custom_cluster_report_runtime_ms(_rtc_last_runtime);
+        _pending_reports++;
+        custom_cluster_report_runtime_ms(_rtc_last_runtime, &s_report_cnf_ctx);
     }
 
     uint8_t batt_zb = batt_pct * 2;
@@ -187,6 +217,7 @@ static void measure_report_and_sleep(void)
                            EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
                            EZB_ZCL_STD_MANUF_CODE, &voltage_zb, false);
     {
+        _pending_reports++;
         ezb_zcl_report_attr_cmd_t cmd = {
             .cmd_ctrl.dst_addr   = EZB_ADDRESS_SHORT(0x0000),
             .cmd_ctrl.dst_ep     = 1,
@@ -194,14 +225,17 @@ static void measure_report_and_sleep(void)
             .cmd_ctrl.cluster_id = EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
             .cmd_ctrl.manuf_code = EZB_ZCL_STD_MANUF_CODE,
             .cmd_ctrl.fc.direction       = 1,
+            .cmd_ctrl.cnf_ctx    = s_report_cnf_ctx,
             .payload.attr_id = EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
         };
         ezb_err_t ret = ezb_zcl_report_attr_cmd_req(&cmd);
         if (ret != EZB_ERR_NONE) {
             ESP_LOGW(TAG, "battery pct report failed: %d", ret);
+            _pending_reports--;
         }
     }
     {
+        _pending_reports++;
         ezb_zcl_report_attr_cmd_t cmd = {
             .cmd_ctrl.dst_addr   = EZB_ADDRESS_SHORT(0x0000),
             .cmd_ctrl.dst_ep     = 1,
@@ -209,18 +243,17 @@ static void measure_report_and_sleep(void)
             .cmd_ctrl.cluster_id = EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
             .cmd_ctrl.manuf_code = EZB_ZCL_STD_MANUF_CODE,
             .cmd_ctrl.fc.direction       = 1,
+            .cmd_ctrl.cnf_ctx    = s_report_cnf_ctx,
             .payload.attr_id = EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
         };
         ezb_err_t ret = ezb_zcl_report_attr_cmd_req(&cmd);
         if (ret != EZB_ERR_NONE) {
             ESP_LOGW(TAG, "battery mV report failed: %d", ret);
+            _pending_reports--;
         }
     }
 
     wait_for_reports();
-
-    /* Total wake-cycle runtime (app_main entry → now) for reporting next cycle */
-    _rtc_last_runtime = (uint32_t)(esp_timer_get_time() / 1000 - _wake_start_ms);
 
     enter_sleep();
 }
@@ -266,7 +299,7 @@ static bool app_signal_handler(const ezb_app_signal_t *app_signal)
                     .name     = "rejoin_timer",
                 };
                 ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_sleep_timer));
-                ESP_ERROR_CHECK(esp_timer_start_once(s_sleep_timer, 5 * 1000000));
+                ESP_ERROR_CHECK(esp_timer_start_once(s_sleep_timer, 10 * 1000));
             }
         } else {
             ESP_LOGW(TAG, "%s failed (0x%02x), retrying init",

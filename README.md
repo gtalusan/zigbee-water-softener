@@ -2,9 +2,9 @@
 
 ![Water softener detector build photo](IMG_8477.jpeg)
 
-ESP32-C6 SuperMini + VL53L0X time-of-flight sensor that measures the distance
-to the salt surface inside a brine tank and reports it via Zigbee every 12 hours.
-Battery level is reported alongside the distance.
+ESP32-C6 or ESP32-H2 SuperMini + VL53L0X time-of-flight sensor that measures the
+distance to the salt surface inside a brine tank and reports it via Zigbee every
+12 hours. Battery level is reported alongside the distance.
 
 **V2 firmware** (ESP-IDF C, `esp32/`) replaces the original Arduino sketch with
 bare-metal deep sleep, a graduated sleep ramp, and RTC-persisted telemetry.
@@ -13,14 +13,14 @@ bare-metal deep sleep, a graduated sleep ramp, and RTC-persisted telemetry.
 
 | Component | Details |
 |-----------|---------|
-| MCU | MakerGO ESP32-C6 SuperMini |
+| MCU | MakerGO ESP32-C6 SuperMini or ESP32-H2 SuperMini |
 | Sensor | VL53L0X ToF distance sensor (I2C) |
 | Power | 4.2V Li-Ion battery |
 | Mounting | Underside of brine tank lid |
 
 ### Wiring
 
-| Signal | ESP32-C6 Pin |
+| Signal | ESP32 Pin (C6 + H2) |
 |--------|-------------|
 | I2C SDA | GP0 |
 | I2C SCL | GP1 |
@@ -65,22 +65,34 @@ and persists telemetry in RTC memory across sleep cycles.
 #### Prerequisites
 
 - ESP-IDF v5.2+ (tested with v5.5.4)
-- ESP32-C6 toolchain (riscv32-esp-elf)
+- ESP32-C6 and/or ESP32-H2 toolchain (riscv32-esp-elf)
 
 ```bash
 # Install ESP-IDF (if not already installed)
 git clone --recursive https://github.com/espressif/esp-idf.git
-cd esp-idf && ./install.sh esp32c6 && . ./export.sh
+cd esp-idf && ./install.sh esp32c6,esp32h2 && . ./export.sh
 ```
 
 #### Compile & Flash
 
 ```bash
 cd esp32
+
+# For ESP32-C6 SuperMini
 idf.py set-target esp32c6
 idf.py build
 idf.py -p /dev/cu.usbmodem* flash
+
+# For ESP32-H2 SuperMini
+idf.py fullclean                  # required when switching targets
+idf.py set-target esp32h2
+idf.py build
+idf.py -p /dev/cu.usbmodem* flash
 ```
+
+> **Note:** Use `idf.py fullclean` when switching targets. For concurrent builds,
+> use separate build directories: `idf.py -B build_c6 set-target esp32c6` /
+> `idf.py -B build_h2 set-target esp32h2`.
 
 #### Monitor
 
