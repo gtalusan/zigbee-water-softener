@@ -191,11 +191,13 @@ static void measure_report_and_sleep(void)
     uint32_t wake_count = ++_rtc_wake_count;
     float    dist       = measure_distance();
     uint8_t  voltage_zb = 0;
-    uint8_t  batt_pct   = measure_battery(&voltage_zb);
+    uint16_t batt_mv    = 0;
+    uint16_t adc_mv     = 0;
+    uint8_t  batt_pct   = measure_battery(&voltage_zb, &batt_mv, &adc_mv);
 
-    ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  voltage=%u mV  wake=%"PRIu32"  rt=%"PRIu32" ms"
+    ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  voltage=%u mV  adc=%u mV  wake=%"PRIu32"  rt=%"PRIu32" ms"
              "  prev_rt=%"PRIu32" ms",
-             dist, batt_pct, voltage_zb * 100, wake_count,
+             dist, batt_pct, batt_mv, adc_mv, wake_count,
              (uint32_t)(esp_timer_get_time() / 1000 - start_ms),
              _rtc_last_runtime);
 

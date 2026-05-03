@@ -27,7 +27,7 @@ enum { SYSRANGE_START=0x00, SYSTEM_SEQUENCE_CONFIG=0x01, SYSTEM_INTERRUPT_CONFIG
        DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD=0x4E, DYNAMIC_SPAD_REF_EN_START_OFFSET=0x4F,
        GLOBAL_CONFIG_SPAD_ENABLES_REF_0=0xB0, GLOBAL_CONFIG_REF_EN_START_SELECT=0xB6 };
 #define calcMacroPeriod(p) ((((uint32_t)2304*(p)*1655)+500)/1000)
-#define dist_samples 10
+#define dist_samples 5
 
 static i2c_master_bus_handle_t  s_i2c_bus;
 static i2c_master_dev_handle_t  s_dev;
@@ -78,7 +78,7 @@ static void setTimingBudget(uint32_t b) {
 
 /* ---------- Pololu init sequence ---------- */
 static bool vl53_init_sensor(void) {
-    for(int i=0;i<5;i++){if(r8(IDENTIFICATION_MODEL_ID)==0xEE)break;vTaskDelay(pdMS_TO_TICKS(5));}
+    for(int i=0;i<5;i++){if(r8(IDENTIFICATION_MODEL_ID)==0xEE)break;}
     if(r8(IDENTIFICATION_MODEL_ID)!=0xEE)return false;
     /* DataInit */
     w(VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV,r8(VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV)|0x01);
@@ -162,18 +162,18 @@ float vl53l0x_measure(void) {
     i2c_device_config_t dc={.dev_addr_length=I2C_ADDR_BIT_LEN_7,.device_address=VL53_ADDR,.scl_speed_hz=I2C_FREQ_HZ};
     ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus,&dc,&s_dev));
 
-    /* power on + init — matching Arduino: digitalWrite(HIGH),delay(10),vl53.init() */
-    gpio_set_level(PIN_VL53_XSHUT,1); vTaskDelay(pdMS_TO_TICKS(10));
+    /* power on + init */
+    gpio_set_level(PIN_VL53_XSHUT,1); vTaskDelay(pdMS_TO_TICKS(2));  /* t_boot ~1.2ms */
     for(int a=0;a<2;a++){
         if(vl53_init_sensor())break;
         ESP_LOGW(TAG,"init attempt %d failed",a);
-        gpio_set_level(PIN_VL53_XSHUT,0);vTaskDelay(pdMS_TO_TICKS(20));
-        gpio_set_level(PIN_VL53_XSHUT,1);vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level(PIN_VL53_XSHUT,0);vTaskDelay(pdMS_TO_TICKS(2));
+        gpio_set_level(PIN_VL53_XSHUT,1);vTaskDelay(pdMS_TO_TICKS(2));
     }
     if(!s_stop){gpio_set_level(PIN_VL53_XSHUT,0);return 0.0f;} /* init failed */
     float r=0.0f;
     /* start continuous, read samples */
-    start_cont();vTaskDelay(pdMS_TO_TICKS(20));read_mm(); /* discard */
+    start_cont();read_mm(); /* discard first — range started before sensor fully ready */
     {int sum=0,mn=99999,mx=0,v=0;
      for(int i=0;i<dist_samples;i++){uint16_t mm=read_mm();if(mm==65535)continue;v++;sum+=mm;if((int)mm<mn)mn=mm;if((int)mm>mx)mx=mm;}
      if(v>=3)r=((float)(sum-mn-mx)/(v-2))/10.0f;else if(v==2)r=(float)sum/20.0f;else if(v==1)r=(float)sum/10.0f;}

@@ -13,12 +13,13 @@
 
 static const char *TAG = "SENSORS";
 
-#define ADC_ATTEN            ADC_ATTEN_DB_11   /* matching Arduino ADC_11db */
+#define ADC_ATTEN            ADC_ATTEN_DB_12
 #define ADC_BITWIDTH         ADC_BITWIDTH_12
 #define ADC_SAMPLES          5
-#define BATT_DIVIDER_RATIO   2.0f   /* 1M + 1M divider, matching Arduino sketch */
-#define BATT_MAX_MV          4200   /* Li-Ion, matching Arduino sketch */
-#define BATT_MIN_MV          3300   /* Li-Ion, matching Arduino sketch */
+#define ADC_VMAX_MV          3300   /* approximate full-scale mV at ADC_ATTEN_DB_12; only used when calibration unavailable */
+#define BATT_DIVIDER_RATIO   2.0f   /* 1M + 1M divider */
+#define BATT_MAX_MV          4200
+#define BATT_MIN_MV          3300
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cali;
@@ -34,9 +35,10 @@ void sensors_init(void)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, BATT_ADC_CHANNEL,
         &(adc_oneshot_chan_cfg_t){.atten = ADC_ATTEN, .bitwidth = ADC_BITWIDTH}));
 
-    /* ADC calibration — ESP32-C6 uses curve fitting (matching Arduino analogReadMilliVolts) */
+    /* ADC calibration */
     adc_cali_curve_fitting_config_t cali_cfg = {
         .unit_id  = ADC_UNIT_1,
+        .chan     = BATT_ADC_CHANNEL,
         .atten    = ADC_ATTEN,
         .bitwidth = ADC_BITWIDTH,
     };
@@ -65,17 +67,15 @@ static float trimmed_average(const int *vals, int n)
     return (float)(sum - min - max) / (n - 2);
 }
 
-uint8_t measure_battery(uint8_t *voltage_out)
+uint8_t measure_battery(uint8_t *voltage_zb_out, uint16_t *mv_out, uint16_t *adc_out)
 {
-    /* dummy read + settle, matching Arduino sketch pattern */
+    /* dummy read to flush any stale internal state */
     int dummy;
     adc_oneshot_read(s_adc, BATT_ADC_CHANNEL, &dummy);
-    vTaskDelay(pdMS_TO_TICKS(10));
 
     int raw_vals[ADC_SAMPLES];
     for (int i = 0; i < ADC_SAMPLES; i++) {
         ESP_ERROR_CHECK(adc_oneshot_read(s_adc, BATT_ADC_CHANNEL, &raw_vals[i]));
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     /* Convert raw to mV using calibration (or linear fallback) */
@@ -84,20 +84,24 @@ uint8_t measure_battery(uint8_t *voltage_out)
         if (s_cali) {
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(s_cali, raw_vals[i], &mv_vals[i]));
         } else {
-            mv_vals[i] = raw_vals[i] * 3300 / 4095;  /* rough fallback */
+            mv_vals[i] = raw_vals[i] * ADC_VMAX_MV / ((1 << ADC_BITWIDTH) - 1);  /* rough fallback */
         }
     }
 
     float avg_mv = trimmed_average(mv_vals, ADC_SAMPLES);
     float vbat_mv = avg_mv * BATT_DIVIDER_RATIO;
 
-    /* Clamp and compute percentage (matching Arduino sketch) */
+    /* Clamp and compute percentage */
     float pct = (vbat_mv - BATT_MIN_MV) / (float)(BATT_MAX_MV - BATT_MIN_MV) * 100.0f;
     if (pct > 100.0f) pct = 100.0f;
     if (pct < 0.0f)   pct = 0.0f;
 
-    if (voltage_out)
-        *voltage_out = (uint8_t)(vbat_mv / 100.0f + 0.5f);
+    if (voltage_zb_out)
+        *voltage_zb_out = (uint8_t)(vbat_mv / 100.0f + 0.5f);
+    if (mv_out)
+        *mv_out = (uint16_t)(vbat_mv + 0.5f);
+    if (adc_out)
+        *adc_out = avg_mv;
 
     return (uint8_t)(pct + 0.5f);
 }
