@@ -7,6 +7,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -15,6 +16,7 @@
 #include "driver/gpio.h"
 
 #include "esp_zigbee.h"
+#include "esp_ota_ops.h"
 #include "custom_cluster.h"
 #include "vl53l0x.h"
 #include "sensors.h"
@@ -34,9 +36,16 @@ static const char *TAG = "WATER_SOFTENER";
 #define SEC_TO_US(s)        ((s) * 1000000ULL)
 
 /* ---------- Zigbee identity ---------- */
-#define ESP_MANUFACTURER_NAME  "\x07""talusan"
-#define ESP_MODEL_IDENTIFIER   "\x1E""talusan.softener.salt-level-v2"
-#define ESP_ZB_STORAGE_PART    "zb_storage"
+#define ESP_MANUFACTURER_NAME     "\x07""talusan"
+#define ESP_MODEL_IDENTIFIER      "\x1E""talusan.softener.salt-level-v2"
+#define ESP_APPLICATION_VERSION   ((uint8_t)0x01)
+#define ESP_ZB_STORAGE_PART       "zb_storage"
+
+/* ---------- OTA ---------- */
+#define ESP_MANUF_CODE       0xBEEF
+#define ESP_IMAGE_TYPE       0x0001
+#define ESP_OTA_FILE_VERSION 0x01000000
+#define OTA_BLOCK_SIZE       223
 
 /* ---------- Zigbee channel mask (Z2M default ch 11) ---------- */
 #define ZB_PRIMARY_CHANNEL_MASK    ((1U << 11))
@@ -74,11 +83,14 @@ static RTC_DATA_ATTR uint64_t _rtc_last_sleep_sec = MIN_SLEEP_SEC;
 static RTC_DATA_ATTR uint32_t _rtc_wake_count;
 static RTC_DATA_ATTR uint32_t _rtc_last_runtime;
 static RTC_DATA_ATTR uint32_t _rtc_vl53_error_count;
-static RTC_DATA_ATTR uint8_t  _rtc_ctx_valid;     // 1 = RTC state is live (not cold boot)
+static RTC_DATA_ATTR uint8_t  _rtc_ctx_valid;     // 0=cold, 1=warm/deep-sleep, 2=OTA just completed
 static uint32_t                _wake_start_ms;      // captured in app_main(), used at sleep
 
 static esp_timer_handle_t s_sleep_timer;  // one-shot timer for deferred sleep
+static esp_timer_handle_t s_ota_timeout_timer;  // clears s_ota_in_progress if no OTA starts
 static bool s_needs_interview;             // captured before steering
+static volatile bool s_ota_in_progress;    // true during OTA — prevents deep sleep
+static esp_ota_handle_t s_ota_handle;       // handle for OTA writes
 
 #define REPORT_TIMEOUT_MS 10000
 
@@ -100,6 +112,10 @@ static void wait_for_reports(void)
 {
     uint32_t t0 = esp_timer_get_time() / 1000;
     while (_pending_reports > 0 && (esp_timer_get_time() / 1000 - t0) < REPORT_TIMEOUT_MS) {
+        if (s_ota_in_progress) {
+            ESP_LOGI(TAG, "OTA started — aborting report wait");
+            return;
+        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     if (_pending_reports > 0) {
@@ -122,6 +138,11 @@ static uint64_t next_sleep_sec(void)
 
 static void enter_sleep(void)
 {
+    if (s_ota_in_progress) {
+        ESP_LOGI(TAG, "OTA in progress — deferring sleep");
+        return;
+    }
+
     uint64_t sec = next_sleep_sec();
     _rtc_last_sleep_sec = sec;
 
@@ -167,6 +188,15 @@ static void sleep_timer_cb(void *arg)
     enter_sleep();
 }
 
+static void ota_timeout_cb(void *arg)
+{
+    if (s_ota_in_progress) {
+        ESP_LOGI(TAG, "OTA timeout — no download started, going to sleep");
+        s_ota_in_progress = false;
+        enter_sleep();
+    }
+}
+
 static void measure_report_and_sleep(void)
 {
     if (s_needs_interview) {
@@ -187,22 +217,28 @@ static void measure_report_and_sleep(void)
         return;
     }
 
+    if (s_ota_in_progress) {
+        /* OTA download running — skip measurement, stay in main loop */
+        return;
+    }
+
+    /* ---------- measurement ---------- */
     uint32_t start_ms   = esp_timer_get_time() / 1000;
     uint32_t wake_count = ++_rtc_wake_count;
     float    dist       = measure_distance();
     uint8_t  voltage_zb = 0;
-    uint16_t batt_mv    = 0;
-    uint16_t adc_mv     = 0;
-    uint8_t  batt_pct   = measure_battery(&voltage_zb, &batt_mv, &adc_mv);
+    uint16_t battery_mv = 0, battery_adc = 0;
+    uint8_t  batt_pct   = measure_battery(&voltage_zb, &battery_mv, &battery_adc);
 
-    ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  voltage=%u mV  adc=%u mV  wake=%"PRIu32"  rt=%"PRIu32" ms"
+    ESP_LOGI(TAG, "dist=%.1f cm  batt=%u%%  voltage=%u mV  wake=%"PRIu32"  rt=%"PRIu32" ms"
              "  prev_rt=%"PRIu32" ms",
-             dist, batt_pct, batt_mv, adc_mv, wake_count,
+             dist, batt_pct, voltage_zb, wake_count,
              (uint32_t)(esp_timer_get_time() / 1000 - start_ms),
              _rtc_last_runtime);
 
     _pending_reports = 0;
 
+    /* ---------- custom cluster reports ---------- */
     if (dist > 0.0f) {
         _pending_reports++;
         custom_cluster_report_distance(dist, &s_report_cnf_ctx);
@@ -214,13 +250,12 @@ static void measure_report_and_sleep(void)
     custom_cluster_report_vl53_error_count(_rtc_vl53_error_count, &s_report_cnf_ctx);
     _pending_reports++;
     custom_cluster_report_wake_count(wake_count, &s_report_cnf_ctx);
-
-    /* Report previous cycle's full runtime */
     if (_rtc_last_runtime > 0) {
         _pending_reports++;
         custom_cluster_report_runtime_ms(_rtc_last_runtime, &s_report_cnf_ctx);
     }
 
+    /* ---------- power config (battery) reports ---------- */
     uint8_t batt_zb = batt_pct * 2;
     ezb_zcl_set_attr_value(ZIGBEE_ENDPOINT, EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                            EZB_ZCL_CLUSTER_SERVER,
@@ -269,6 +304,38 @@ static void measure_report_and_sleep(void)
 
     wait_for_reports();
 
+    /* ---------- OTA query ---------- */
+    {
+        ezb_zcl_ota_upgrade_query_next_image_req_cmd_t ota_query = {
+            .cmd_ctrl.dst_addr = EZB_ADDRESS_SHORT(0x0000),
+            .cmd_ctrl.dst_ep   = 1,
+            .cmd_ctrl.src_ep   = ZIGBEE_ENDPOINT,
+            .payload.fc           = 1,
+            .payload.manuf_code   = ESP_MANUF_CODE,
+            .payload.image_type   = ESP_IMAGE_TYPE,
+            .payload.file_version = ESP_OTA_FILE_VERSION,
+            .payload.hw_version   = 0,
+        };
+        ezb_zcl_ota_upgrade_query_next_image_cmd_req(&ota_query);
+    }
+
+    /* Wait up to 15 s for the OTA query response.  If Z2M says
+       "update available" the query response handler extends this
+       to 90 s for the download.  If "no update" or no reply,
+       we sleep after 15 s. */
+    {
+        const esp_timer_create_args_t targs = {
+            .callback = ota_timeout_cb,
+            .name     = "ota_timeout",
+        };
+        if (!s_ota_timeout_timer) {
+            ESP_ERROR_CHECK(esp_timer_create(&targs, &s_ota_timeout_timer));
+        }
+        s_ota_in_progress = true;
+        esp_timer_stop(s_ota_timeout_timer);
+        esp_timer_start_once(s_ota_timeout_timer, 15 * 1000000);
+    }
+
     enter_sleep();
 }
 
@@ -313,7 +380,7 @@ static bool app_signal_handler(const ezb_app_signal_t *app_signal)
                     .name     = "rejoin_timer",
                 };
                 ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_sleep_timer));
-                ESP_ERROR_CHECK(esp_timer_start_once(s_sleep_timer, 10 * 1000));
+                ESP_ERROR_CHECK(esp_timer_start_once(s_sleep_timer, 5 * 1000));
             }
         } else {
             ESP_LOGW(TAG, "%s failed (0x%02x), retrying init",
@@ -352,13 +419,148 @@ static bool app_signal_handler(const ezb_app_signal_t *app_signal)
     return true;
 }
 
+/* ---------- OTA upgrade handlers ---------- */
+static void zcl_ota_upgrade_client_progress_handler(
+    ezb_zcl_ota_upgrade_client_progress_message_t *message)
+{
+    esp_err_t ret = ESP_OK;
+
+    switch (message->in.progress) {
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_START: {
+        ESP_LOGI(TAG, "OTA start: ver=0x%08lx size=%ld",
+                 message->in.start.file_version, message->in.start.image_size);
+
+        if (s_ota_timeout_timer) {
+            esp_timer_stop(s_ota_timeout_timer);
+        }
+
+        const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+        if (!part) {
+            ESP_LOGE(TAG, "No OTA partition found");
+            ret = ESP_ERR_NOT_FOUND;
+            break;
+        }
+        ret = esp_ota_begin(part, OTA_SIZE_UNKNOWN, &s_ota_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(ret));
+            break;
+        }
+        s_ota_in_progress = true;
+        ESP_LOGI(TAG, "OTA writing to partition %s", part->label);
+        break;
+    }
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_RECEIVING: {
+        /* Z2M sends the OTA-wrapped file (56-byte OTA header +
+           6-byte tag-and-length sub-element wrapper).  Raw binary
+           starts at OTA_FILE_RECORD_OFFSET within the stream. */
+        uint32_t off   = message->in.receiving.file_offset;
+        uint8_t *data  = message->in.receiving.block;
+        uint32_t len   = message->in.receiving.block_size;
+        const uint32_t BIN_START = 56 + 2 + 4;  /* header + tag + length */
+
+        if (off < BIN_START) {
+            uint32_t skip = BIN_START - off;
+            if (skip >= len) break;  /* entire block is metadata */
+            data += skip;
+            len  -= skip;
+        }
+        if (len > 0) {
+            ret = esp_ota_write(s_ota_handle, data, len);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "esp_ota_write failed at offset %ld: %s",
+                         message->in.receiving.file_offset, esp_err_to_name(ret));
+            }
+        }
+        break;
+    }
+
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_CHECK:
+        ESP_LOGI(TAG, "OTA check: ver=0x%08lx", message->in.check.file_version);
+        break;
+
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_APPLY:
+        ESP_LOGI(TAG, "OTA apply: ver=0x%08lx", message->in.apply.file_version);
+        ret = esp_ota_end(s_ota_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(ret));
+            break;
+        }
+        ret = esp_ota_set_boot_partition(
+            esp_ota_get_next_update_partition(NULL));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s",
+                     esp_err_to_name(ret));
+        }
+        break;
+
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_FINISH:
+        ESP_LOGI(TAG, "OTA finish — restarting");
+        _rtc_ctx_valid = 2;  /* signal next boot that OTA completed */
+        esp_restart();
+        break;
+
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_ABORT:
+        if (s_ota_timeout_timer) {
+            esp_timer_stop(s_ota_timeout_timer);
+        }
+        esp_ota_abort(s_ota_handle);
+        s_ota_in_progress = false;
+        ESP_LOGW(TAG, "OTA aborted");
+        break;
+
+    default:
+        ESP_LOGW(TAG, "Unknown OTA progress: %d", message->in.progress);
+        break;
+    }
+
+    message->out.result = (ret == ESP_OK) ? EZB_ZCL_STATUS_SUCCESS
+                                          : EZB_ZCL_STATUS_ABORT;
+}
+
+static void zcl_ota_upgrade_client_query_next_image_rsp_handler(
+    ezb_zcl_ota_upgrade_query_next_image_rsp_message_t *message)
+{
+    ESP_LOGI(TAG, "OTA query response: status=0x%02x manuf=0x%04x type=0x%04x ver=0x%08lx size=%ld",
+             message->in.image.status,
+             message->in.image.manuf_code, message->in.image.image_type,
+             message->in.image.file_version, message->in.image.size);
+
+    if (message->in.image.status == EZB_ZCL_OTA_UPGRADE_STATUS_CODE_SUCCESS) {
+        s_ota_in_progress = true;
+        /* restart the timeout from the query response arrival */
+        esp_timer_stop(s_ota_timeout_timer);
+        esp_timer_start_once(s_ota_timeout_timer, 90 * 1000000);
+    } else {
+        ESP_LOGI(TAG, "OTA query: no update available (status=0x%02x)", message->in.image.status);
+        s_ota_in_progress = false;
+        if (s_ota_timeout_timer) {
+            esp_timer_stop(s_ota_timeout_timer);
+        }
+        enter_sleep();
+    }
+    message->out.result = EZB_ZCL_STATUS_SUCCESS;
+}
+
 /* ---------- ZCL core action handler ---------- */
 static void zcl_core_action_handler(ezb_zcl_core_action_callback_id_t cb_id, void *msg)
 {
-    if (cb_id == EZB_ZCL_CORE_DEFAULT_RSP_CB_ID) {
+    switch (cb_id) {
+    case EZB_ZCL_CORE_OTA_UPGRADE_CLIENT_PROGRESS_CB_ID:
+        zcl_ota_upgrade_client_progress_handler(
+            (ezb_zcl_ota_upgrade_client_progress_message_t *)msg);
+        break;
+    case EZB_ZCL_CORE_OTA_UPGRADE_QUERY_NEXT_IMAGE_RSP_CB_ID:
+        zcl_ota_upgrade_client_query_next_image_rsp_handler(
+            (ezb_zcl_ota_upgrade_query_next_image_rsp_message_t *)msg);
+        break;
+    case EZB_ZCL_CORE_DEFAULT_RSP_CB_ID: {
         ezb_zcl_cmd_default_rsp_message_t *rsp =
             (ezb_zcl_cmd_default_rsp_message_t *)msg;
         ESP_LOGD(TAG, "ZCL rsp: status=0x%02x", rsp->in.status_code);
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -379,6 +581,11 @@ static esp_err_t create_device(void)
         EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void *)ESP_MANUFACTURER_NAME);
     ezb_zcl_basic_cluster_desc_add_attr(basic_desc,
         EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)ESP_MODEL_IDENTIFIER);
+    {
+        uint8_t app_ver = ESP_APPLICATION_VERSION;
+        ezb_zcl_basic_cluster_desc_add_attr(basic_desc,
+            EZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID, &app_ver);
+    }
     ESP_LOGI(TAG, "Model: %s", ESP_MODEL_IDENTIFIER + 1);
 
     /* Identify cluster */
@@ -403,6 +610,26 @@ static esp_err_t create_device(void)
         ezb_zcl_cluster_add_attr_desc(pwr_desc, mv_attr);
     }
 
+    /* OTA Upgrade client cluster.
+       SDK serialization garbles multi-byte fields (missing __attribute__((packed))):
+         ESP_MANUF_CODE   0xBEEF → Z2M reads 0xBE00 = 48640
+         ESP_IMAGE_TYPE   0x0001 → Z2M reads 1         (passes through)
+       Use the Z2M-visible values so the SDK's internal validation matches. */
+    ezb_zcl_ota_upgrade_cluster_client_config_t ota_cfg = {
+        .upgrade_server_id    = EZB_ZCL_OTA_UPGRADE_UPGRADE_SERVER_ID_DEFAULT_VALUE,
+        .file_offset          = 0,
+        .image_upgrade_status = EZB_ZCL_OTA_UPGRADE_IMAGE_UPGRADE_STATUS_DEFAULT_VALUE,
+        .manufacturer_id      = (ESP_MANUF_CODE & 0xFF00), /* 0xBE00 — Z2M-visible */
+        .image_type_id        = ESP_IMAGE_TYPE,
+    };
+    ezb_zcl_cluster_desc_t ota_desc =
+        ezb_zcl_ota_upgrade_create_cluster_desc(&ota_cfg, EZB_ZCL_CLUSTER_CLIENT);
+    {
+        uint32_t current_file_version = ESP_OTA_FILE_VERSION;
+        ezb_zcl_ota_upgrade_cluster_desc_add_attr(ota_desc,
+            EZB_ZCL_ATTR_OTA_UPGRADE_CURRENT_FILE_VERSION_ID, &current_file_version);
+    }
+
     /* Endpoint */
     ezb_af_ep_config_t ep_cfg = {
         .ep_id              = ZIGBEE_ENDPOINT,
@@ -415,6 +642,7 @@ static esp_err_t create_device(void)
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep_desc, basic_desc));
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep_desc, identify_desc));
     ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep_desc, pwr_desc));
+    ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep_desc, ota_desc));
 
     ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev_desc, ep_desc));
 
@@ -423,7 +651,10 @@ static esp_err_t create_device(void)
 
     ESP_ERROR_CHECK(ezb_af_device_desc_register(dev_desc));
 
+    ezb_zcl_ota_upgrade_set_download_block_size(ZIGBEE_ENDPOINT, OTA_BLOCK_SIZE);
+
     ezb_zcl_core_action_handler_register(zcl_core_action_handler);
+    ezb_zcl_ota_upgrade_cluster_client_init(ZIGBEE_ENDPOINT);
 
     return ESP_OK;
 }
@@ -478,7 +709,18 @@ void app_main(void)
     esp_reset_reason_t reason = esp_reset_reason();
     ESP_LOGI(TAG, "Reset reason: %d", reason);
 
-    if (!_rtc_ctx_valid) {
+    if (_rtc_ctx_valid == 2) {
+        /* OTA just completed — request re-interview */
+        ESP_LOGI(TAG, "OTA completed — requesting re-interview");
+        _rtc_initial_sleeps = 0;
+        _rtc_ramp_elapsed   = 0;
+        _rtc_last_sleep_sec = MIN_SLEEP_SEC;
+        _rtc_wake_count       = 0;
+        _rtc_last_runtime     = 0;
+        _rtc_vl53_error_count = 0;
+        _rtc_ctx_valid        = 0;
+        s_needs_interview     = true;
+    } else if (!_rtc_ctx_valid) {
         /* true cold boot or RTC data was garbage */
         _rtc_initial_sleeps = 0;
         _rtc_ramp_elapsed   = 0;
@@ -516,6 +758,7 @@ void app_main(void)
     };
     gpio_config(&unused_cfg);
 
+    esp_log_level_set("*", ESP_LOG_DEBUG);
     ESP_LOGI(TAG, "Starting Zigbee stack");
     xTaskCreate(zigbee_task, "zb_task", 4096, NULL, 5, NULL);
 }

@@ -74,6 +74,7 @@ const v2Definition = {
     description: 'Water softener salt level sensor (v2, custom cluster)',
     fromZigbee: [fzCustomV2, fz.battery],
     toZigbee: [],
+    ota: true,
     exposes: [
         exposes.numeric('distance', ea.STATE)
             .withUnit('cm')
@@ -100,6 +101,7 @@ const v2Definition = {
         const endpoint = device.getEndpoint(1);
         await endpoint.bind('genPowerCfg', coordinatorEndpoint);
         await endpoint.bind(0xFC00, coordinatorEndpoint);
+        await endpoint.bind('genOta', coordinatorEndpoint);
     },
 };
 
